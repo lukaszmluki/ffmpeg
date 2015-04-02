@@ -29,6 +29,9 @@
 #include <limits.h>
 #include <signal.h>
 #include <stdint.h>
+#if HAVE_TERMIOS_H
+#include <termios.h>
+#endif
 
 #include "libavutil/avstring.h"
 #include "libavutil/colorspace.h"
@@ -1690,7 +1693,7 @@ display:
         }
     }
     is->force_refresh = 0;
-    if (show_status) {
+    if (show_status && is->ic) {
         static int64_t last_time;
         int64_t cur_time;
         int aqsize, vqsize, sqsize;
@@ -3781,6 +3784,62 @@ static int lockmgr(void **mtx, enum AVLockOp op)
    return 1;
 }
 
+static void console_change_echo(int echo)
+{
+#if HAVE_TERMIOS_H
+    struct termios t;
+    tcgetattr(0, &t);
+    if (echo)
+        t.c_lflag |= ECHO;
+    else
+        t.c_lflag &= ~ECHO;
+    tcsetattr(0, TCSANOW, &t);
+#endif
+}
+
+static int credetials_callback_get_val(const char *query, const char *default_val, char **value)
+{
+    char val[1024];
+    size_t len;
+
+    if (default_val)
+        printf("Enter %s [%s]: ", query, default_val);
+    else
+        printf("Enter %s: ", query);
+    fflush(stdout);
+    fgets(val, sizeof(val), stdin);
+    len = strlen(val);
+    if (len > 1) {
+        av_freep(value);
+        val[len - 1] = '\0'; //remove trailing \n
+        *value = av_strdup(val);
+        if (!*value)
+            return AVERROR(ENOMEM);
+    }
+    return 0;
+}
+
+static int credetials_callback_func(AVIOCredentials *credentials, void *opaque)
+{
+    int ret = 0;
+
+    printf("Provide credentials for URL: %s\n", credentials->url);
+    if (credentials->username)
+        ret = credetials_callback_get_val("username", credentials->username, &credentials->username);
+    if (credentials->password && ret >= 0) {
+        console_change_echo(0);
+        ret = credetials_callback_get_val("password", NULL, &credentials->password);
+        console_change_echo(1);
+    }
+    printf("\n");
+    return ret;
+}
+
+static const AVIOCredentialsCB credetials_callback = {
+    .callback = credetials_callback_func,
+    .opaque = NULL,
+};
+
 /* Called from the main */
 int main(int argc, char **argv)
 {
@@ -3800,6 +3859,8 @@ int main(int argc, char **argv)
 #endif
     av_register_all();
     avformat_network_init();
+
+    avio_register_default_credentials_callback(&credetials_callback);
 
     init_opts();
 
