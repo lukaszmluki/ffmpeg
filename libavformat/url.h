@@ -47,6 +47,7 @@ typedef struct URLContext {
     int is_connected;
     AVIOInterruptCB interrupt_callback;
     int64_t rw_timeout;         /**< maximum time to wait for (network) read/write operation completion, in mcs */
+    AVIOCredentialsCB credentials_callback;
 } URLContext;
 
 typedef struct URLProtocol {
@@ -290,5 +291,16 @@ void ff_make_absolute_url(char *buf, int size, const char *base,
  */
 AVIODirEntry *ff_alloc_dir_entry(void);
 
+/**
+ * Get user provided credentials.
+ *
+ * May be called with NULL credentials (or even protocol context) to probe implementation.
+ * Must not be called with NULL context when credentials is not NULL.
+ *
+ * @param h                  protocol context
+ * @param[inout] credentials credentails data, may be NULL for implementation probing.
+ * @return                   >=0 on success, negative on error
+ */
+int ff_url_get_credentials(const URLContext *h, AVIOCredentials *credentials);
 
 #endif /* AVFORMAT_URL_H */

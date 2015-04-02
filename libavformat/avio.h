@@ -53,6 +53,27 @@ typedef struct AVIOInterruptCB {
 } AVIOInterruptCB;
 
 /**
+ * User provided URL credentials. Used by AVIOCredentialsCB.
+ * Protocol may ask for all fields or only for some of the (e.g. for password only).
+ * Protocol allocates required fields with default values (empty string for no default).
+ * Non-allocated fields must be skipped by the user.
+ * Allocated fields may be reallocated with their new values provided by the user.
+ */
+typedef struct AVIOCredentials {
+    char *url;                            /**< Read only, never include any credentials */
+    char *username;                       /**< User's name */
+    char *password;                       /**< User's password */
+} AVIOCredentials;
+
+/**
+ * Callback for asking user to enter URL credentials.
+ */
+typedef struct AVIOCredentialsCB {
+    int (*callback)(AVIOCredentials *credentials, void*);
+    void *opaque;
+} AVIOCredentialsCB;
+
+/**
  * Directory entry types.
  */
 enum AVIODirEntryType {
@@ -616,5 +637,12 @@ struct AVBPrint;
  * code otherwise
  */
 int avio_read_to_bprint(AVIOContext *h, struct AVBPrint *pb, size_t max_size);
+
+
+/**
+ * Register credentials callback
+ * @param callback callback data
+ */
+void avio_register_default_credentials_callback(const AVIOCredentialsCB *callback);
 
 #endif /* AVFORMAT_AVIO_H */

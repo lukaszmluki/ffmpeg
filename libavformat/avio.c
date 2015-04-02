@@ -30,8 +30,11 @@
 #include "network.h"
 #endif
 #include "url.h"
+#include "internal.h"
 
 static URLProtocol *first_protocol = NULL;
+
+static AVIOCredentialsCB g_credentials_callback;
 
 URLProtocol *ffurl_protocol_next(const URLProtocol *prev)
 {
@@ -542,4 +545,47 @@ int ff_check_interrupt(AVIOInterruptCB *cb)
     if (cb && cb->callback && (ret = cb->callback(cb->opaque)))
         return ret;
     return 0;
+}
+
+void avio_register_default_credentials_callback(const AVIOCredentialsCB *callback)
+{
+    if (callback)
+        g_credentials_callback = *callback;
+}
+
+int ff_url_get_credentials(const URLContext *h, AVIOCredentials *credentials)
+{
+    char url[MAX_URL_SIZE], proto[MAX_URL_SIZE], host[MAX_URL_SIZE];
+    int port, ret = 0;
+
+    if (!credentials) {
+        //probe
+        if (g_credentials_callback.callback || (h && h->credentials_callback.callback))
+            return 0;
+        return AVERROR(ENOSYS);
+    }
+
+    av_assert0(h);
+    av_url_split(proto, sizeof(proto), NULL, 0, host, sizeof(host), &port, NULL, 0, h->filename);
+    ff_url_join(url, sizeof(url), proto, NULL, host, port, NULL);
+
+    av_free(credentials->url);
+    credentials->url = av_strdup(url);
+    if (!credentials->url) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+    if (h->credentials_callback.callback)
+        ret = h->credentials_callback.callback(credentials, h->credentials_callback.opaque);
+    else if (g_credentials_callback.callback)
+        ret = g_credentials_callback.callback(credentials, g_credentials_callback.opaque);
+    else
+        ret = AVERROR(ENOSYS);
+  fail:
+    av_freep(&credentials->url);
+    if (ret < 0) {
+        av_freep(&credentials->username);
+        av_freep(&credentials->password);
+    }
+    return ret;
 }
