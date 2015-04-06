@@ -74,6 +74,36 @@ static const AVClass ftp_context_class = {
 
 static int ftp_close(URLContext *h);
 
+static int ftp_get_password(URLContext *h)
+{
+    FTPContext *s = h->priv_data;
+    int ret;
+    AVIOCredentials cretentials = {
+        .username = av_strdup(av_x_if_null(s->user, "anonymous")),
+        .password = av_strdup(av_x_if_null(s->password, "")),
+    };
+
+    if (!cretentials.username || !cretentials.password) {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+
+    if ((ret = ff_url_get_credentials(h, &cretentials)) < 0)
+        goto fail;
+
+    av_free(s->user);
+    av_free(s->password);
+    s->user = cretentials.username;
+    s->password = cretentials.password;
+
+    return 0;
+
+  fail:
+    av_free(cretentials.username);
+    av_free(cretentials.password);
+    return ret;
+}
+
 static int ftp_getc(FTPContext *s)
 {
     int len;
@@ -82,7 +112,7 @@ static int ftp_getc(FTPContext *s)
         if (len < 0) {
             return len;
         } else if (!len) {
-            return -1;
+            return AVERROR(EPIPE);
         } else {
             s->control_buf_ptr = s->control_buffer;
             s->control_buf_end = s->control_buffer + len;
@@ -191,7 +221,7 @@ static int ftp_send_command(FTPContext *s, const char *command,
     if ((err = ffurl_write(s->conn_control, command, strlen(command))) < 0)
         return err;
     if (!err)
-        return -1;
+        return AVERROR(EPIPE);
 
     /* return status */
     if (response_codes) {
@@ -213,12 +243,13 @@ static void ftp_close_both_connections(FTPContext *s)
     ftp_close_data_connection(s);
 }
 
-static int ftp_auth(FTPContext *s)
+static int ftp_auth(URLContext *h)
 {
+    FTPContext *s = h->priv_data;
     char buf[CONTROL_BUFFER_SIZE];
     int err;
-    static const int user_codes[] = {331, 230, 0};
-    static const int pass_codes[] = {230, 0};
+    static const int user_codes[] = {421, 331, 230, 0};
+    static const int pass_codes[] = {421, 230, 0};
 
     snprintf(buf, sizeof(buf), "USER %s\r\n", s->user);
     err = ftp_send_command(s, buf, user_codes, NULL);
@@ -229,6 +260,10 @@ static int ftp_auth(FTPContext *s)
         } else
             return AVERROR(EACCES);
     }
+    if (err < 0)
+        return err;
+    if (err == 421)
+        return AVERROR(EPIPE);
     if (err != 230)
         return AVERROR(EACCES);
 
@@ -434,6 +469,17 @@ static int ftp_restart(FTPContext *s, int64_t pos)
     return 0;
 }
 
+static int ftp_noop(FTPContext *s)
+{
+    static const char *command = "TYPE I\r\n";
+    static const int noop_codes[] = {200, 0};
+
+    if (ftp_send_command(s, command, noop_codes, NULL) != 200)
+        return AVERROR(EIO);
+
+    return 0;
+}
+
 static int ftp_features(FTPContext *s)
 {
     static const char *feat_command        = "FEAT\r\n";
@@ -459,6 +505,11 @@ static int ftp_connect_control_connection(URLContext *h)
     FTPContext *s = h->priv_data;
     static const int connect_codes[] = {220, 0};
 
+    if (s->conn_control) {
+        /* check if connection is alive */
+        if (ftp_noop(s) < 0)
+            ftp_close_both_connections(s);
+    }
     if (!s->conn_control) {
         ff_url_join(buf, sizeof(buf), "tcp", NULL,
                     s->hostname, s->server_control_port, NULL);
@@ -484,10 +535,21 @@ static int ftp_connect_control_connection(URLContext *h)
         }
         av_free(response);
 
-        if ((err = ftp_auth(s)) < 0) {
-            av_log(h, AV_LOG_ERROR, "FTP authentication failed\n");
-            return err;
-        }
+        do {
+            err = ftp_auth(h);
+            if (err >= 0)
+                break;
+            if (err < 0 && err != AVERROR(EACCES)) {
+                if (err != AVERROR(EPIPE))
+                    av_log(h, AV_LOG_ERROR, "FTP authentication failed\n");
+                return err;
+            }
+            if ((err = ftp_get_password(h)) < 0) {
+                if (err == AVERROR(ENOSYS))
+                    err = AVERROR(EACCES);
+                return err;
+            }
+        } while (1);
 
         if ((err = ftp_type(s)) < 0) {
             av_log(h, AV_LOG_ERROR, "Set content type failed\n");
@@ -575,7 +637,7 @@ static int ftp_open(URLContext *h, const char *url, int flags)
     char proto[10], path[MAX_URL_SIZE], credencials[MAX_URL_SIZE], hostname[MAX_URL_SIZE];
     const char *tok_user = NULL, *tok_pass = NULL;
     char *end = NULL;
-    int err;
+    int err, retry = 100;
     size_t pathlen;
     FTPContext *s = h->priv_data;
 
@@ -596,7 +658,7 @@ static int ftp_open(URLContext *h, const char *url, int flags)
     tok_pass = av_strtok(end, ":", &end);
     if (!tok_user) {
         tok_user = "anonymous";
-        tok_pass = av_x_if_null(s->anonymous_password, "nopassword");
+        tok_pass = s->anonymous_password;
     }
     s->user = av_strdup(tok_user);
     s->password = av_strdup(tok_pass);
@@ -609,8 +671,16 @@ static int ftp_open(URLContext *h, const char *url, int flags)
     if (s->server_control_port < 0 || s->server_control_port > 65535)
         s->server_control_port = 21;
 
-    if ((err = ftp_connect_control_connection(h)) < 0)
-        goto fail;
+    do {
+        err = ftp_connect_control_connection(h);
+        if (err >= 0)
+            break;
+        if (err < 0) {
+            if (err == AVERROR(EPIPE))
+                continue;
+            goto fail;
+        }
+    } while(retry--);
 
     if ((err = ftp_current_dir(s)) < 0)
         goto fail;
