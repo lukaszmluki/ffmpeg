@@ -54,7 +54,8 @@
 #endif
 
 #include <SDL.h>
-#include <SDL_thread.h>
+
+#include <ffplay_thread.h>
 
 #include "cmdutils.h"
 
@@ -119,8 +120,8 @@ typedef struct PacketQueue {
     int size;
     int abort_request;
     int serial;
-    SDL_mutex *mutex;
-    SDL_cond *cond;
+    ff_mutex *mutex;
+    ff_cond *cond;
 } PacketQueue;
 
 #define VIDEO_PICTURE_QUEUE_SIZE 3
@@ -172,8 +173,8 @@ typedef struct FrameQueue {
     int max_size;
     int keep_last;
     int rindex_shown;
-    SDL_mutex *mutex;
-    SDL_cond *cond;
+    ff_mutex *mutex;
+    ff_cond *cond;
     PacketQueue *pktq;
 } FrameQueue;
 
@@ -191,16 +192,16 @@ typedef struct Decoder {
     int pkt_serial;
     int finished;
     int packet_pending;
-    SDL_cond *empty_queue_cond;
+    ff_cond *empty_queue_cond;
     int64_t start_pts;
     AVRational start_pts_tb;
     int64_t next_pts;
     AVRational next_pts_tb;
-    SDL_Thread *decoder_tid;
+    ff_thread *decoder_tid;
 } Decoder;
 
 typedef struct VideoState {
-    SDL_Thread *read_tid;
+    ff_thread *read_tid;
     AVInputFormat *iformat;
     int abort_request;
     int force_refresh;
@@ -305,7 +306,7 @@ typedef struct VideoState {
 
     int last_video_stream, last_audio_stream, last_subtitle_stream;
 
-    SDL_cond *continue_read_thread;
+    ff_cond *continue_read_thread;
 } VideoState;
 
 /* options specified by the user */
@@ -418,7 +419,7 @@ static int packet_queue_put_private(PacketQueue *q, AVPacket *pkt)
     q->nb_packets++;
     q->size += pkt1->pkt.size + sizeof(*pkt1);
     /* XXX: should duplicate packet data in DV case */
-    SDL_CondSignal(q->cond);
+    ff_cond_signal(q->cond);
     return 0;
 }
 
@@ -426,9 +427,9 @@ static int packet_queue_put(PacketQueue *q, AVPacket *pkt)
 {
     int ret;
 
-    SDL_LockMutex(q->mutex);
+    ff_mutex_lock(q->mutex);
     ret = packet_queue_put_private(q, pkt);
-    SDL_UnlockMutex(q->mutex);
+    ff_mutex_unlock(q->mutex);
 
     if (pkt != &flush_pkt && ret < 0)
         av_packet_unref(pkt);
@@ -450,14 +451,14 @@ static int packet_queue_put_nullpacket(PacketQueue *q, int stream_index)
 static int packet_queue_init(PacketQueue *q)
 {
     memset(q, 0, sizeof(PacketQueue));
-    q->mutex = SDL_CreateMutex();
+    q->mutex = ff_mutex_create();
     if (!q->mutex) {
-        av_log(NULL, AV_LOG_FATAL, "SDL_CreateMutex(): %s\n", SDL_GetError());
+        av_log(NULL, AV_LOG_FATAL, "ff_mutex_create(): failed\n");
         return AVERROR(ENOMEM);
     }
-    q->cond = SDL_CreateCond();
+    q->cond = ff_cond_create();
     if (!q->cond) {
-        av_log(NULL, AV_LOG_FATAL, "SDL_CreateCond(): %s\n", SDL_GetError());
+        av_log(NULL, AV_LOG_FATAL, "ff_cond_create(): failed\n");
         return AVERROR(ENOMEM);
     }
     q->abort_request = 1;
@@ -468,7 +469,7 @@ static void packet_queue_flush(PacketQueue *q)
 {
     MyAVPacketList *pkt, *pkt1;
 
-    SDL_LockMutex(q->mutex);
+    ff_mutex_lock(q->mutex);
     for (pkt = q->first_pkt; pkt; pkt = pkt1) {
         pkt1 = pkt->next;
         av_packet_unref(&pkt->pkt);
@@ -478,33 +479,33 @@ static void packet_queue_flush(PacketQueue *q)
     q->first_pkt = NULL;
     q->nb_packets = 0;
     q->size = 0;
-    SDL_UnlockMutex(q->mutex);
+    ff_mutex_unlock(q->mutex);
 }
 
 static void packet_queue_destroy(PacketQueue *q)
 {
     packet_queue_flush(q);
-    SDL_DestroyMutex(q->mutex);
-    SDL_DestroyCond(q->cond);
+    ff_mutex_destroy(q->mutex);
+    ff_cond_destroy(q->cond);
 }
 
 static void packet_queue_abort(PacketQueue *q)
 {
-    SDL_LockMutex(q->mutex);
+    ff_mutex_lock(q->mutex);
 
     q->abort_request = 1;
 
-    SDL_CondSignal(q->cond);
+    ff_cond_signal(q->cond);
 
-    SDL_UnlockMutex(q->mutex);
+    ff_mutex_unlock(q->mutex);
 }
 
 static void packet_queue_start(PacketQueue *q)
 {
-    SDL_LockMutex(q->mutex);
+    ff_mutex_lock(q->mutex);
     q->abort_request = 0;
     packet_queue_put_private(q, &flush_pkt);
-    SDL_UnlockMutex(q->mutex);
+    ff_mutex_unlock(q->mutex);
 }
 
 /* return < 0 if aborted, 0 if no packet and > 0 if packet.  */
@@ -513,7 +514,7 @@ static int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block, int *seria
     MyAVPacketList *pkt1;
     int ret;
 
-    SDL_LockMutex(q->mutex);
+    ff_mutex_lock(q->mutex);
 
     for (;;) {
         if (q->abort_request) {
@@ -538,14 +539,14 @@ static int packet_queue_get(PacketQueue *q, AVPacket *pkt, int block, int *seria
             ret = 0;
             break;
         } else {
-            SDL_CondWait(q->cond, q->mutex);
+            ff_cond_wait(q->cond, q->mutex);
         }
     }
-    SDL_UnlockMutex(q->mutex);
+    ff_mutex_unlock(q->mutex);
     return ret;
 }
 
-static void decoder_init(Decoder *d, AVCodecContext *avctx, PacketQueue *queue, SDL_cond *empty_queue_cond) {
+static void decoder_init(Decoder *d, AVCodecContext *avctx, PacketQueue *queue, ff_cond *empty_queue_cond) {
     memset(d, 0, sizeof(Decoder));
     d->avctx = avctx;
     d->queue = queue;
@@ -566,7 +567,7 @@ static int decoder_decode_frame(Decoder *d, AVFrame *frame, AVSubtitle *sub) {
             AVPacket pkt;
             do {
                 if (d->queue->nb_packets == 0)
-                    SDL_CondSignal(d->empty_queue_cond);
+                    ff_cond_signal(d->empty_queue_cond);
                 if (packet_queue_get(d->queue, &pkt, 1, &d->pkt_serial) < 0)
                     return -1;
                 if (pkt.data == flush_pkt.data) {
@@ -659,12 +660,12 @@ static int frame_queue_init(FrameQueue *f, PacketQueue *pktq, int max_size, int 
 {
     int i;
     memset(f, 0, sizeof(FrameQueue));
-    if (!(f->mutex = SDL_CreateMutex())) {
-        av_log(NULL, AV_LOG_FATAL, "SDL_CreateMutex(): %s\n", SDL_GetError());
+    if (!(f->mutex = ff_mutex_create())) {
+        av_log(NULL, AV_LOG_FATAL, "ff_mutex_create(): failed\n");
         return AVERROR(ENOMEM);
     }
-    if (!(f->cond = SDL_CreateCond())) {
-        av_log(NULL, AV_LOG_FATAL, "SDL_CreateCond(): %s\n", SDL_GetError());
+    if (!(f->cond = ff_cond_create())) {
+        av_log(NULL, AV_LOG_FATAL, "ff_cond_create(): failed\n");
         return AVERROR(ENOMEM);
     }
     f->pktq = pktq;
@@ -685,15 +686,15 @@ static void frame_queue_destory(FrameQueue *f)
         av_frame_free(&vp->frame);
         free_picture(vp);
     }
-    SDL_DestroyMutex(f->mutex);
-    SDL_DestroyCond(f->cond);
+    ff_mutex_destroy(f->mutex);
+    ff_cond_destroy(f->cond);
 }
 
 static void frame_queue_signal(FrameQueue *f)
 {
-    SDL_LockMutex(f->mutex);
-    SDL_CondSignal(f->cond);
-    SDL_UnlockMutex(f->mutex);
+    ff_mutex_lock(f->mutex);
+    ff_cond_signal(f->cond);
+    ff_mutex_unlock(f->mutex);
 }
 
 static Frame *frame_queue_peek(FrameQueue *f)
@@ -714,12 +715,12 @@ static Frame *frame_queue_peek_last(FrameQueue *f)
 static Frame *frame_queue_peek_writable(FrameQueue *f)
 {
     /* wait until we have space to put a new frame */
-    SDL_LockMutex(f->mutex);
+    ff_mutex_lock(f->mutex);
     while (f->size >= f->max_size &&
            !f->pktq->abort_request) {
-        SDL_CondWait(f->cond, f->mutex);
+        ff_cond_wait(f->cond, f->mutex);
     }
-    SDL_UnlockMutex(f->mutex);
+    ff_mutex_unlock(f->mutex);
 
     if (f->pktq->abort_request)
         return NULL;
@@ -730,12 +731,12 @@ static Frame *frame_queue_peek_writable(FrameQueue *f)
 static Frame *frame_queue_peek_readable(FrameQueue *f)
 {
     /* wait until we have a readable a new frame */
-    SDL_LockMutex(f->mutex);
+    ff_mutex_lock(f->mutex);
     while (f->size - f->rindex_shown <= 0 &&
            !f->pktq->abort_request) {
-        SDL_CondWait(f->cond, f->mutex);
+        ff_cond_wait(f->cond, f->mutex);
     }
-    SDL_UnlockMutex(f->mutex);
+    ff_mutex_unlock(f->mutex);
 
     if (f->pktq->abort_request)
         return NULL;
@@ -747,10 +748,10 @@ static void frame_queue_push(FrameQueue *f)
 {
     if (++f->windex == f->max_size)
         f->windex = 0;
-    SDL_LockMutex(f->mutex);
+    ff_mutex_lock(f->mutex);
     f->size++;
-    SDL_CondSignal(f->cond);
-    SDL_UnlockMutex(f->mutex);
+    ff_cond_signal(f->cond);
+    ff_mutex_unlock(f->mutex);
 }
 
 static void frame_queue_next(FrameQueue *f)
@@ -762,10 +763,10 @@ static void frame_queue_next(FrameQueue *f)
     frame_queue_unref_item(&f->queue[f->rindex]);
     if (++f->rindex == f->max_size)
         f->rindex = 0;
-    SDL_LockMutex(f->mutex);
+    ff_mutex_lock(f->mutex);
     f->size--;
-    SDL_CondSignal(f->cond);
-    SDL_UnlockMutex(f->mutex);
+    ff_cond_signal(f->cond);
+    ff_mutex_unlock(f->mutex);
 }
 
 /* jump back to the previous frame if available by resetting rindex_shown */
@@ -796,7 +797,7 @@ static void decoder_abort(Decoder *d, FrameQueue *fq)
 {
     packet_queue_abort(d->queue);
     frame_queue_signal(fq);
-    SDL_WaitThread(d->decoder_tid, NULL);
+    ff_thread_wait(d->decoder_tid, NULL);
     d->decoder_tid = NULL;
     packet_queue_flush(d->queue);
 }
@@ -1198,7 +1199,7 @@ static void stream_close(VideoState *is)
 {
     /* XXX: use a special url_shutdown call to abort parse cleanly */
     is->abort_request = 1;
-    SDL_WaitThread(is->read_tid, NULL);
+    ff_thread_wait(is->read_tid, NULL);
 
     /* close each stream */
     if (is->audio_stream >= 0)
@@ -1218,7 +1219,7 @@ static void stream_close(VideoState *is)
     frame_queue_destory(&is->pictq);
     frame_queue_destory(&is->sampq);
     frame_queue_destory(&is->subpq);
-    SDL_DestroyCond(is->continue_read_thread);
+    ff_cond_destroy(is->continue_read_thread);
 #if !CONFIG_AVFILTER
     sws_freeContext(is->img_convert_ctx);
 #endif
@@ -1416,7 +1417,7 @@ static void stream_seek(VideoState *is, int64_t pos, int64_t rel, int seek_by_by
         if (seek_by_bytes)
             is->seek_flags |= AVSEEK_FLAG_BYTE;
         is->seek_req = 1;
-        SDL_CondSignal(is->continue_read_thread);
+        ff_cond_signal(is->continue_read_thread);
     }
 }
 
@@ -1570,10 +1571,10 @@ retry:
             if (delay > 0 && time - is->frame_timer > AV_SYNC_THRESHOLD_MAX)
                 is->frame_timer = time;
 
-            SDL_LockMutex(is->pictq.mutex);
+            ff_mutex_lock(is->pictq.mutex);
             if (!redisplay && !isnan(vp->pts))
                 update_video_pts(is, vp->pts, vp->pos, vp->serial);
-            SDL_UnlockMutex(is->pictq.mutex);
+            ff_mutex_unlock(is->pictq.mutex);
 
             if (frame_queue_nb_remaining(&is->pictq) > 1) {
                 Frame *nextvp = frame_queue_peek_next(&is->pictq);
@@ -1687,10 +1688,10 @@ static void alloc_picture(VideoState *is)
         do_exit(is);
     }
 
-    SDL_LockMutex(is->pictq.mutex);
+    ff_mutex_lock(is->pictq.mutex);
     vp->allocated = 1;
-    SDL_CondSignal(is->pictq.cond);
-    SDL_UnlockMutex(is->pictq.mutex);
+    ff_cond_signal(is->pictq.cond);
+    ff_mutex_unlock(is->pictq.mutex);
 }
 
 static void duplicate_right_border_pixels(SDL_Overlay *bmp) {
@@ -1743,17 +1744,17 @@ static int queue_picture(VideoState *is, AVFrame *src_frame, double pts, double 
         SDL_PushEvent(&event);
 
         /* wait until the picture is allocated */
-        SDL_LockMutex(is->pictq.mutex);
+        ff_mutex_lock(is->pictq.mutex);
         while (!vp->allocated && !is->videoq.abort_request) {
-            SDL_CondWait(is->pictq.cond, is->pictq.mutex);
+            ff_cond_wait(is->pictq.cond, is->pictq.mutex);
         }
         /* if the queue is aborted, we have to pop the pending ALLOC event or wait for the allocation to complete */
         if (is->videoq.abort_request && SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_EVENTMASK(FF_ALLOC_EVENT)) != 1) {
             while (!vp->allocated && !is->abort_request) {
-                SDL_CondWait(is->pictq.cond, is->pictq.mutex);
+                ff_cond_wait(is->pictq.cond, is->pictq.mutex);
             }
         }
-        SDL_UnlockMutex(is->pictq.mutex);
+        ff_mutex_unlock(is->pictq.mutex);
 
         if (is->videoq.abort_request)
             return -1;
@@ -2158,12 +2159,12 @@ static int audio_thread(void *arg)
     return ret;
 }
 
-static int decoder_start(Decoder *d, int (*fn)(void *), void *arg)
+static int decoder_start(Decoder *d, ff_thread_fun fn, void *arg)
 {
     packet_queue_start(d->queue);
-    d->decoder_tid = SDL_CreateThread(fn, arg);
+    d->decoder_tid = ff_thread_create(fn, arg);
     if (!d->decoder_tid) {
-        av_log(NULL, AV_LOG_ERROR, "SDL_CreateThread(): %s\n", SDL_GetError());
+        av_log(NULL, AV_LOG_ERROR, "ff_thread_create(): failed\n");
         return AVERROR(ENOMEM);
     }
     return 0;
@@ -2830,12 +2831,12 @@ static int read_thread(void *arg)
     AVDictionaryEntry *t;
     AVDictionary **opts;
     int orig_nb_streams;
-    SDL_mutex *wait_mutex = SDL_CreateMutex();
+    ff_mutex *wait_mutex = ff_mutex_create();
     int scan_all_pmts_set = 0;
     int64_t pkt_ts;
 
     if (!wait_mutex) {
-        av_log(NULL, AV_LOG_FATAL, "SDL_CreateMutex(): %s\n", SDL_GetError());
+        av_log(NULL, AV_LOG_FATAL, "ff_mutex_create(): failed\n");
         ret = AVERROR(ENOMEM);
         goto fail;
     }
@@ -3070,9 +3071,9 @@ static int read_thread(void *arg)
                     || (is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC))
                 && (is->subtitleq.nb_packets > MIN_FRAMES || is->subtitle_stream < 0 || is->subtitleq.abort_request)))) {
             /* wait 10 ms */
-            SDL_LockMutex(wait_mutex);
-            SDL_CondWaitTimeout(is->continue_read_thread, wait_mutex, 10);
-            SDL_UnlockMutex(wait_mutex);
+            ff_mutex_lock(wait_mutex);
+            ff_cond_wait_timeout(is->continue_read_thread, wait_mutex, 10);
+            ff_mutex_unlock(wait_mutex);
             continue;
         }
         if (!is->paused &&
@@ -3098,9 +3099,9 @@ static int read_thread(void *arg)
             }
             if (ic->pb && ic->pb->error)
                 break;
-            SDL_LockMutex(wait_mutex);
-            SDL_CondWaitTimeout(is->continue_read_thread, wait_mutex, 10);
-            SDL_UnlockMutex(wait_mutex);
+            ff_mutex_lock(wait_mutex);
+            ff_cond_wait_timeout(is->continue_read_thread, wait_mutex, 10);
+            ff_mutex_unlock(wait_mutex);
             continue;
         } else {
             is->eof = 0;
@@ -3137,7 +3138,7 @@ static int read_thread(void *arg)
         event.user.data1 = is;
         SDL_PushEvent(&event);
     }
-    SDL_DestroyMutex(wait_mutex);
+    ff_mutex_destroy(wait_mutex);
     return 0;
 }
 
@@ -3168,8 +3169,8 @@ static VideoState *stream_open(const char *filename, AVInputFormat *iformat)
         packet_queue_init(&is->subtitleq) < 0)
         goto fail;
 
-    if (!(is->continue_read_thread = SDL_CreateCond())) {
-        av_log(NULL, AV_LOG_FATAL, "SDL_CreateCond(): %s\n", SDL_GetError());
+    if (!(is->continue_read_thread = ff_cond_create())) {
+        av_log(NULL, AV_LOG_FATAL, "ff_cond_create(): failed\n");
         goto fail;
     }
 
@@ -3180,9 +3181,9 @@ static VideoState *stream_open(const char *filename, AVInputFormat *iformat)
     is->audio_volume = SDL_MIX_MAXVOLUME;
     is->muted = 0;
     is->av_sync_type = av_sync_type;
-    is->read_tid     = SDL_CreateThread(read_thread, is);
+    is->read_tid     = ff_thread_create(read_thread, is);
     if (!is->read_tid) {
-        av_log(NULL, AV_LOG_FATAL, "SDL_CreateThread(): %s\n", SDL_GetError());
+        av_log(NULL, AV_LOG_FATAL, "ff_thread_create(): failed\n");
 fail:
         stream_close(is);
         return NULL;
@@ -3746,18 +3747,18 @@ static int lockmgr(void **mtx, enum AVLockOp op)
 {
    switch(op) {
       case AV_LOCK_CREATE:
-          *mtx = SDL_CreateMutex();
+          *mtx = ff_mutex_create();
           if(!*mtx) {
-              av_log(NULL, AV_LOG_FATAL, "SDL_CreateMutex(): %s\n", SDL_GetError());
+              av_log(NULL, AV_LOG_FATAL, "ff_mutex_create(): failed\n");
               return 1;
           }
           return 0;
       case AV_LOCK_OBTAIN:
-          return !!SDL_LockMutex(*mtx);
+          return !!ff_mutex_lock(*mtx);
       case AV_LOCK_RELEASE:
-          return !!SDL_UnlockMutex(*mtx);
+          return !!ff_mutex_unlock(*mtx);
       case AV_LOCK_DESTROY:
-          SDL_DestroyMutex(*mtx);
+          ff_mutex_destroy(*mtx);
           return 0;
    }
    return 1;

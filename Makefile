@@ -38,6 +38,7 @@ endif
 OBJS-ffmpeg-$(CONFIG_VIDEOTOOLBOX) += ffmpeg_videotoolbox.o
 OBJS-ffmpeg-$(CONFIG_LIBMFX)  += ffmpeg_qsv.o
 OBJS-ffserver                 += ffserver_config.o
+OBJS-ffplay                   += ffplay_thread.o
 
 TESTTOOLS   = audiogen videogen rotozoom tiny_psnr tiny_ssim base64
 HOSTPROGS  := $(TESTTOOLS:%=tests/%) doc/print_options
