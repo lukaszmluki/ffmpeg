@@ -21,7 +21,9 @@
 #include <config.h>
 #include <ffplay_thread.h>
 
-#if HAVE_SDL
+#if HAVE_PTHREADS
+#include <ffplay_thread_pthread.c>
+#elif HAVE_SDL
 #include <ffplay_thread_sdl.c>
 #endif
 
